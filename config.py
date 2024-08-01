@@ -1,3 +1,5 @@
-api_key = 'transit_api_key_here'
-lat = 1.2345
-lon = 6.7890
+from collections import namedtuple
+Stop = namedtuple('Stop', ['line', 'stop_code'])
+api_key = ['511_api_key', '511_api_key_2']
+agency = 'SF'
+stops = [Stop('A', '123123'), Stop('B', '456456')]
