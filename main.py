@@ -92,13 +92,21 @@ class SF511API:
 class TransitDisplayDriver:
     def __init__(self, api: SF511API,
                  stops: List[Stop],
+                 ignored_alert_text: List[str],
                  predictions_query_interval: int = 60,
                  alerts_query_interval: int = 3600,
                  draw_interval: float = 1,
                  train_stale_secs: int = 120):
-        self.data = {line: [] for line, _ in stops}
-        self.data_last_updated = {line: time() for line, _ in stops}
-        self.data_locks = {line: threading.Lock() for line, _ in stops}
+        self.prediction_times = {line: [] for line, _ in stops}
+        self.prediction_time_locks = {line: threading.Lock() for line, _ in stops}
+
+        self.prediction_data_last_updated = None
+        self.prediction_data_last_updated_lock = threading.Lock()
+
+        self.ignored_alert_text = ignored_alert_text
+        self.alerts = {line: str for line, _ in stops}
+        self.alert_data_last_updated = None
+        self.alert_data_lock = threading.Lock()
 
         self.api = api
         self.stops = stops
@@ -131,6 +139,7 @@ class TransitDisplayDriver:
     """
     def run(self):
         # initialize data first
+
         # run each query in its own thread (LEGACY CODE)
         # for line, stop_code in self.stops:
         #     self.fetch_data(line, stop_code)
@@ -140,12 +149,15 @@ class TransitDisplayDriver:
         # for thread in fetch_threads:
         #     thread.start()
 
+        self.fetch_alerts()
         self.fetch_all_predictions()
 
-        fetch_thread = threading.Thread(target=self.query_call_loop_thread, args=(self.fetch_all_predictions,))
+        fetch_thread = threading.Thread(target=self.query_call_loop_thread, args=(self.fetch_all_predictions, self.predictions_query_interval))
         fetch_thread.start()
 
         # TODO: implement alerts
+        alerts_thread = threading.Thread(target=self.query_call_loop_thread, args=(self.fetch_alerts,self.alerts_query_interval))
+        alerts_thread.start()
 
         font = graphics.Font()
         font.LoadFont("fonts/clR6x12.bdf")
@@ -167,9 +179,9 @@ class TransitDisplayDriver:
             canvas.Clear()
 
             # draw times
-            with self.data_locks[self.stops[0].line] and self.data_locks[self.stops[1].line]:
-                top_str = self.expected_times_to_display_str(self.stops[0].line, self.data[self.stops[0].line])
-                bottom_str = self.expected_times_to_display_str(self.stops[1].line, self.data[self.stops[1].line])
+            with self.prediction_time_locks[self.stops[0].line] and self.prediction_time_locks[self.stops[1].line]:
+                top_str = self.expected_times_to_display_str(self.stops[0].line, self.prediction_times[self.stops[0].line])
+                bottom_str = self.expected_times_to_display_str(self.stops[1].line, self.prediction_times[self.stops[1].line])
 
             graphics.DrawText(canvas, font, 2, y, red, top_str)
             y += gap
@@ -177,7 +189,7 @@ class TransitDisplayDriver:
 
             # draw staleness
             # TODO: make this based on the entire thread finishing all api requests
-            secs_last_updated = max(0, round(time() - max(self.data_last_updated.values())))
+            secs_last_updated = max(0, round(time() - self.prediction_data_last_updated))
             # graphics.DrawText(canvas, small_font, 50, 30, red, f'{mins_last_updated}m')
 
             # draw update animation, a train moving down the right side
@@ -209,15 +221,43 @@ class TransitDisplayDriver:
         three_expected_times = expected_times[:3]
         return line_name + '-' + ','.join([str(max(0, floor((expected_time - now) / 60))) for expected_time in three_expected_times])
 
-    def query_call_loop_thread(self, query_call: Callable):
-        sleep(self.predictions_query_interval)
+    def query_call_loop_thread(self, query_call: Callable, interval: int):
+        sleep(interval)
         while True:
             query_call()
-            sleep(self.predictions_query_interval)
+            sleep(interval)
 
     def fetch_alerts(self):
         print('Fetching alerts...')
         alerts_raw = self.api.fetch_alerts()
+        now = time()
+
+        # parse data
+        alerts = [entity['Alert'] for entity in alerts_raw['Entities']]
+
+        stop_to_alert_data = {stop.line: [alert['HeaderText']['Translations'] for alert in alerts
+                                                                if any(period['Start'] <= now <= period['End']
+                                                                       for period in alert['ActivePeriods'])
+                                                                and stop.stop_code in [ie['StopId']
+                                                                                       for ie in alert['InformedEntities']
+                                                                                       if 'StopId' in ie]]
+                              for stop in self.stops}
+
+        stop_to_alert_strs = {stop: [next((t['Text'] for t in alert
+                                                       if t['Language'] == 'en'
+                                                       and not any(ignored_text in t['Text']
+                                                                   for ignored_text in self.ignored_alert_text)), None)
+                                       for alert in alert_data]
+                      for stop, alert_data in stop_to_alert_data.items()}
+
+        stop_to_alert_strs = {stop: [a for a in alert_str if a is not None] for stop, alert_str in stop_to_alert_strs.items()}
+
+        with self.alert_data_lock:
+            self.alert_data_last_updated = time()
+            self.alerts = stop_to_alert_strs
+
+        print('Alerts fetched!')
+        pass
 
     def fetch_all_predictions(self):
         print('Fetching all stops...')
@@ -229,6 +269,10 @@ class TransitDisplayDriver:
 
         for thread in threads:
             thread.join()
+
+        with self.prediction_data_last_updated_lock:
+            self.prediction_data_last_updated = time()
+
         print('All stops fetched!')
 
     def fetch_and_parse_predictions(self, line: str, stop_code: str):
@@ -238,9 +282,8 @@ class TransitDisplayDriver:
                                     raw_data['ServiceDelivery']['StopMonitoringDelivery']['MonitoredStopVisit']]
         expected_times = [datetime.fromisoformat(time_str).timestamp() for time_str in expected_visit_time_strs if time_str is not None]
 
-        with self.data_locks[line]:
-            self.data[line] = expected_times
-            self.data_last_updated[line] = time()
+        with self.prediction_time_locks[line]:
+            self.prediction_times[line] = expected_times
 
 
 def main():
@@ -252,7 +295,7 @@ def main():
     sys.stdout = F()
 
     api = SF511API(api_keys=config.api_key, agency=config.agency)
-    driver = TransitDisplayDriver(api=api, predictions_query_interval=60, draw_interval=0.5, stops=config.stops)
+    driver = TransitDisplayDriver(api=api, predictions_query_interval=60, draw_interval=0.5, stops=config.stops, ignored_alert_text=config.ignored_alert_text)
 
     # capture ctrl-c and terminate all threads
     try:
