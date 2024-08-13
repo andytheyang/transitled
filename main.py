@@ -82,9 +82,7 @@ class SF511API:
 
                 return response.json()
             except requests.RequestException as e:
-                print(f"fetch_data() HTTP Error: {e}")
-                print(f"Retrying in {backoff} seconds...")
-                # TODO: tune backoff
+                print(f"fetch_data() {url} HTTP Error: {e}, retrying in {backoff} seconds...")
                 sleep(backoff)
                 backoff *= 2
                 continue
@@ -98,33 +96,71 @@ class TransitDisplayDriver:
                  alerts_query_interval: int = 60,
                  draw_interval: float = 1,
                  train_stale_secs: int = 120):
+        # data structures for storing api data
         self.prediction_times: Dict[str, List[float]] = {line: [] for line, _ in stops}
         self.prediction_time_locks = {line: threading.Lock() for line, _ in stops}
 
         self.prediction_data_last_updated = 0
         self.prediction_data_last_updated_lock = threading.Lock()
 
-        self.ignored_alert_text = ignored_alert_text
         self.alerts: Dict[str, List[str]] = {line: [] for line, _ in stops}
         self.alert_data_last_updated = 0
         self.alert_data_lock = threading.Lock()
 
+        # settings
         self.api = api
         self.stops = stops
+        self.ignored_alert_text = ignored_alert_text
         self.rgb_options = RGBMatrixOptions()
         self.predictions_query_interval = predictions_query_interval
         self.alerts_query_interval = alerts_query_interval
         self.draw_interval = draw_interval
         self.train_stale_secs = train_stale_secs
 
-        # TODO: store this in config.py?
+        # matrix settings
         self.rgb_options.rows = 32
         self.rgb_options.cols = 64
-        self.rgb_options.pwm_bits = 3      # TODO: reduce to 3 if flickering under load
-        self.rgb_options.show_refresh_rate = 1
+        self.rgb_options.pwm_bits = 3      # reduce to 3 if flickering under load
+        # self.rgb_options.show_refresh_rate = 1
         self.rgb_options.gpio_slowdown = 2
-
         self.matrix = RGBMatrix(options=self.rgb_options)
+        self.canvas = self.matrix.CreateFrameCanvas()
+
+        # colors, font, offsets, positions
+        self.font = graphics.Font()
+        self.font.LoadFont("fonts/clR6x12.bdf")
+        self.font_width = 6      # this differs from font.baseline for some reason
+
+        brightness_factor = 1.5
+        self.top_line_color = graphics.Color(0, 91 * brightness_factor, 149 * brightness_factor)
+        self.bottom_line_color = graphics.Color(169 * brightness_factor, 102 * brightness_factor, 20 * brightness_factor)
+        self.line_text_color = graphics.Color(255, 255, 255) # white
+        self.predictions_color = graphics.Color(255, 80, 0) # mostly reddish orange
+        self.train_default_color = graphics.Color(255, 80, 0)
+        self.train_updated_color = graphics.Color(0, 255, 0) # green
+
+        self.train_length = 5
+        self.train_slowdown_factor = 10
+
+        self.line_letter_x = 4
+        self.top_y = 12
+        self.bottom_y = 26
+
+        # start with text off screen
+        self.top_text_scroll_offset = self.rgb_options.cols
+        self.bottom_text_scroll_offset = self.rgb_options.cols
+
+        self.circle_offset_x = 2
+        self.circle_offset_y = -4
+        self.circle_radius = 5
+
+        self.prediction_text_offset = 11
+
+        # state
+        self.train_color = self.train_default_color
+        self.train_pos = 0
+        self.train_slowdown_counter = 0
+
 
     """
     Have separate thread to fetch data
@@ -139,127 +175,94 @@ class TransitDisplayDriver:
             
     """
     def run(self):
-        # initialize data first
-
         fetch_thread = threading.Thread(target=self.query_call_loop_thread, args=(self.fetch_all_predictions, self.predictions_query_interval))
         fetch_thread.start()
 
         alerts_thread = threading.Thread(target=self.query_call_loop_thread, args=(self.fetch_alerts, self.alerts_query_interval))
         alerts_thread.start()
 
-        font = graphics.Font()
-        font.LoadFont("fonts/clR6x12.bdf")
-        font_width = 6      # this differs from font.baseline for some reason
-
-        red = graphics.Color(255, 0, 0)
-        orange = graphics.Color(255, 165, 0)
-        cyan = graphics.Color(0, 255, 255)
-        blue = graphics.Color(0, 0, 255)
-        green = graphics.Color(0, 255, 0)
-        white = graphics.Color(255, 255, 255)
-
-        brightness_factor = 1.5
-        top_line_color = graphics.Color(0, 91 * brightness_factor, 149 * brightness_factor)
-        bottom_line_color = graphics.Color(169 * brightness_factor, 102 * brightness_factor, 20 * brightness_factor)
-        line_text_color = white
-        predictions_color = graphics.Color(255, 80, 0)
-        train_default_color = graphics.Color(255, 80, 0)
-        train_updated_color = green
-
-        train_color = train_default_color
-        train_pos = 0
-        train_length = 5
-        train_slowdown_counter = 0
-        train_slowdown_factor = 10
-
-        line_letter_x = 4
-        top_y = 12
-        bottom_y = 26
-
-        # start with text off screen
-        top_text_scroll_offset = self.rgb_options.cols
-        bottom_text_scroll_offset = self.rgb_options.cols
-
-        circle_offset_x = 2
-        circle_offset_y = -4
-        circle_radius = 5
-
-        prediction_text_offset = 11
-
-        canvas = self.matrix.CreateFrameCanvas()
         while True:
+            self.canvas.Clear()
 
-            canvas.Clear()
+            bottom_str, top_str = self.get_prediction_strs()
+            bottom_alert_str, top_alert_str = self.get_alert_strs()
 
-            # get prediction text (i.e. "2, 5, 10")
-            with self.prediction_time_locks[self.stops[0].line] and self.prediction_time_locks[self.stops[1].line]:
-                top_str = self.expected_times_to_display_str(self.prediction_times[self.stops[0].line])
-                bottom_str = self.expected_times_to_display_str(self.prediction_times[self.stops[1].line])
+            self.top_text_scroll_offset = self.draw_line_data(self.top_y, self.stops[0].line, self.top_line_color, top_str, top_alert_str, self.top_text_scroll_offset)
+            self.bottom_text_scroll_offset = self.draw_line_data(self.bottom_y, self.stops[1].line, self.bottom_line_color, bottom_str, bottom_alert_str, self.bottom_text_scroll_offset)
 
-            # get alert text
-            with self.alert_data_lock:
-                top_alert_str = " / ".join(self.alerts[self.stops[0].line])
-                bottom_alert_str = " / ".join(self.alerts[self.stops[1].line])
-                # bottom_alert_str = "J-Church Outbound: No Service"
+            self.draw_train_animation()
 
-            # top line
-            # predictions (need to be drawn first because there is an erasure square drawn)
-            if not top_alert_str == "":
-                top_text_scroll_offset = self.draw_text_scroll(canvas, top_alert_str, font, font_width, predictions_color,
-                                                               line_letter_x + prediction_text_offset, top_y,
-                                                               top_text_scroll_offset)
-            else:
-                top_text_scroll_offset = self.rgb_options.cols  # reset offset to the right side
-                graphics.DrawText(canvas, font, line_letter_x + prediction_text_offset, top_y, predictions_color, top_str)
-            # circle
-            graphics.DrawCircle(canvas, line_letter_x + circle_offset_x, top_y + circle_offset_y, circle_radius, top_line_color)
-            # line letter
-            graphics.DrawText(canvas, font, line_letter_x, top_y, line_text_color, self.stops[0].line)
-
-
-            # bottom line
-            # predictions
-            if not bottom_alert_str == "":
-                bottom_text_scroll_offset = self.draw_text_scroll(canvas, bottom_alert_str, font, font_width, predictions_color,
-                                                                  line_letter_x + prediction_text_offset, bottom_y,
-                                                                  bottom_text_scroll_offset)
-            else:
-                bottom_text_scroll_offset = self.rgb_options.cols  # reset offset to the right side
-                graphics.DrawText(canvas, font, line_letter_x + prediction_text_offset, bottom_y, predictions_color, bottom_str)
-            # circle
-            graphics.DrawCircle(canvas, line_letter_x + circle_offset_x, bottom_y + circle_offset_y, circle_radius, bottom_line_color)
-            # line letter
-            graphics.DrawText(canvas, font, line_letter_x, bottom_y, line_text_color, self.stops[1].line)
-
-            # draw staleness
-            # TODO: make this based on the entire thread finishing all api requests
-            now = time()
-            secs_last_updated = max(0, round(now - self.prediction_data_last_updated))
-
-            # draw update animation, a train moving across the top
-            # when data is stale, the train shakes
-            train_slowdown_counter = (train_slowdown_counter + 1) % train_slowdown_factor
-            if train_slowdown_counter == 0:
-                train_color = train_default_color
-                if secs_last_updated >= self.train_stale_secs:
-                    train_pos = 35 if train_pos == 34 else 34
-                else:
-                    train_pos = (train_pos + 1) % (65 + train_length)
-                    if secs_last_updated < 2:
-                        train_color = train_updated_color
-
-            # top side
-            graphics.DrawLine(canvas, train_pos - train_length, 0, train_pos, 0, train_color)
-
-
-            canvas = self.matrix.SwapOnVSync(canvas)
-            # print('Display updated, sleeping...')
+            self.canvas = self.matrix.SwapOnVSync(self.canvas)
             sleep(self.draw_interval)
+
+    def get_alert_strs(self):
+        # get alert text
+        with self.alert_data_lock:
+            top_alert_str = " / ".join(self.alerts[self.stops[0].line])
+            bottom_alert_str = " / ".join(self.alerts[self.stops[1].line])
+            # bottom_alert_str = "J-Church Outbound: No Service"
+        return bottom_alert_str, top_alert_str
+
+    def get_prediction_strs(self):
+        # get prediction text (i.e. "2, 5, 10")
+        with self.prediction_time_locks[self.stops[0].line] and self.prediction_time_locks[self.stops[1].line]:
+            top_str = self.expected_times_to_display_str(self.prediction_times[self.stops[0].line])
+            bottom_str = self.expected_times_to_display_str(self.prediction_times[self.stops[1].line])
+        return bottom_str, top_str
+
+    def draw_line_data(self, y_pos: int, line_letter: str, line_color: graphics.Color, predictions_str: str, alert_str: str, scroll_offset: int) -> int:
+        '''
+
+        :param y_pos:
+        :param line_letter:
+        :param line_color:
+        :param predictions_str:
+        :param alert_str:
+        :param scroll_offset: Updated scroll offset to be persisted on draw loop
+        :return:
+        '''
+
+        # predictions (need to be drawn first because there is an erasure square drawn)
+        if not alert_str == "":
+            scroll_offset = self.draw_text_scroll(self.canvas, alert_str, self.font, self.font_width,
+                                                  self.predictions_color,
+                                                  self.line_letter_x + self.prediction_text_offset,
+                                                  y_pos,
+                                                  scroll_offset)
+        else:
+            scroll_offset = self.rgb_options.cols  # reset offset to the right side
+            graphics.DrawText(self.canvas, self.font, self.line_letter_x + self.prediction_text_offset, y_pos,
+                              self.predictions_color, predictions_str)
+        # circle
+        graphics.DrawCircle(self.canvas, self.line_letter_x + self.circle_offset_x, y_pos + self.circle_offset_y,
+                            self.circle_radius, line_color)
+        # line letter
+        graphics.DrawText(self.canvas, self.font, self.line_letter_x, y_pos, self.line_text_color,
+                          line_letter)
+
+        return scroll_offset
+
+    def draw_train_animation(self):
+        # draw staleness
+        # TODO: make this based on the entire thread finishing all api requests
+        now = time()
+        secs_last_updated = max(0, round(now - self.prediction_data_last_updated))
+        # draw update animation, a train moving across the top
+        # when data is stale, the train shakes
+        self.train_slowdown_counter = (self.train_slowdown_counter + 1) % self.train_slowdown_factor
+        if self.train_slowdown_counter == 0:
+            self.train_color = self.train_default_color
+            if secs_last_updated >= self.train_stale_secs:
+                self.train_pos = 35 if self.train_pos == 34 else 34
+            else:
+                self.train_pos = (self.train_pos + 1) % (65 + self.train_length)
+                if secs_last_updated < 2:
+                    self.train_color = self.train_updated_color
+        graphics.DrawLine(self.canvas, self.train_pos - self.train_length, 0, self.train_pos, 0, self.train_color)
 
     def draw_text_scroll(self, canvas: RGBMatrix, text: str, font: graphics.Font, font_width: int,
                          color: graphics.Color, x: int, y: int, offset: int) -> int:
         '''
-
         :param canvas:
         :param text:
         :param x: x position of the initial text display position
@@ -306,19 +309,19 @@ class TransitDisplayDriver:
         alerts = [entity['Alert'] for entity in alerts_raw['Entities']]
 
         stop_to_alert_data = {stop.line: [alert['HeaderText']['Translations'] for alert in alerts
-                                                                if any(period['Start'] <= now <= period['End']
-                                                                       for period in alert['ActivePeriods'])
-                                                                and stop.stop_code in [ie['StopId']
-                                                                                       for ie in alert['InformedEntities']
-                                                                                       if 'StopId' in ie]]
+                                          if any(period['Start'] <= now <= period['End']
+                                                 for period in alert['ActivePeriods'])
+                                          and stop.stop_code in [ie['StopId']
+                                                                 for ie in alert['InformedEntities']
+                                                                 if 'StopId' in ie]]
                               for stop in self.stops}
 
         stop_to_alert_strs = {stop: [next((t['Text'] for t in alert
-                                                       if t['Language'] == 'en'
-                                                       and not any(ignored_text in t['Text']
-                                                                   for ignored_text in self.ignored_alert_text)), None)
-                                       for alert in alert_data]
-                      for stop, alert_data in stop_to_alert_data.items()}
+                                           if t['Language'] == 'en'
+                                           and not any(ignored_text in t['Text']
+                                                       for ignored_text in self.ignored_alert_text)), None)
+                                     for alert in alert_data]
+                              for stop, alert_data in stop_to_alert_data.items()}
 
         stop_to_alert_strs = {stop: [a for a in alert_str if a is not None] for stop, alert_str in stop_to_alert_strs.items()}
 
