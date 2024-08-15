@@ -154,7 +154,8 @@ class TransitDisplayDriver:
         self.circle_offset_y = -4
         self.circle_radius = 5
 
-        self.prediction_text_offset = 11
+        self.data_text_x = 15
+        self.data_text_x_erase_offset = -3
 
         # state
         self.train_color = self.train_default_color
@@ -226,12 +227,13 @@ class TransitDisplayDriver:
         if not alert_str == "":
             scroll_offset = self.draw_text_scroll(self.canvas, alert_str, self.font, self.font_width,
                                                   self.predictions_color,
-                                                  self.line_letter_x + self.prediction_text_offset,
+                                                  self.data_text_x,
                                                   y_pos,
-                                                  scroll_offset)
+                                                  scroll_offset,
+                                                  x_erase_offset=self.data_text_x_erase_offset)
         else:
             scroll_offset = self.rgb_options.cols  # reset offset to the right side
-            graphics.DrawText(self.canvas, self.font, self.line_letter_x + self.prediction_text_offset, y_pos,
+            graphics.DrawText(self.canvas, self.font, self.data_text_x, y_pos,
                               self.predictions_color, predictions_str)
         # circle
         graphics.DrawCircle(self.canvas, self.line_letter_x + self.circle_offset_x, y_pos + self.circle_offset_y,
@@ -261,7 +263,7 @@ class TransitDisplayDriver:
         graphics.DrawLine(self.canvas, self.train_pos - self.train_length, 0, self.train_pos, 0, self.train_color)
 
     def draw_text_scroll(self, canvas: RGBMatrix, text: str, font: graphics.Font, font_width: int,
-                         color: graphics.Color, x: int, y: int, offset: int) -> int:
+                         color: graphics.Color, x: int, y: int, offset: int, x_erase_offset: int = 0) -> int:
         '''
         :param canvas:
         :param text:
@@ -271,6 +273,7 @@ class TransitDisplayDriver:
         :param font:
         :param font_width: width of character (this may differ from font.baseline)
         :param color:
+        :param x_erase_offset: offset to erase text (put negative number if you want the scrolling text to go a little further left)
         :return: New offset value (to be persisted in loop and passed back in for next scroll
         '''
 
@@ -278,7 +281,7 @@ class TransitDisplayDriver:
         graphics.DrawText(canvas, font, x + offset, y, color, text)
 
         # draw block on left side to erase scrolling characters
-        for i in range(x):
+        for i in range(x + x_erase_offset):
             graphics.DrawLine(canvas, i, y + 2, i, y - font.height, graphics.Color(0, 0, 0))
 
         if offset <= -font_width * len(text):       # if all characters have been scrolled off
