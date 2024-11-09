@@ -188,6 +188,8 @@ class TransitDisplayDriver:
             bottom_str, top_str = self.get_prediction_strs()
             bottom_alert_str, top_alert_str = self.get_alert_strs()
 
+            # bottom_alert_str = "Welcome to Andy + Lin-Lin's Housewarming!!"
+
             self.top_text_scroll_offset = self.draw_line_data(self.top_y, self.stops[0].line, self.top_line_color, top_str, top_alert_str, self.top_text_scroll_offset)
             self.bottom_text_scroll_offset = self.draw_line_data(self.bottom_y, self.stops[1].line, self.bottom_line_color, bottom_str, bottom_alert_str, self.bottom_text_scroll_offset)
 
